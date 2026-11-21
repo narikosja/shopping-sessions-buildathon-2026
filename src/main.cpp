@@ -5,6 +5,7 @@
 #include <atomic>
 #include <exception>
 #include <iostream>
+#include <memory>
 #include <mutex>
 #include <numeric>
 #include <thread>
@@ -215,7 +216,37 @@ struct Click {
     uint32_t campaign;
 };
 
-using EventCopies = std::array<std::vector<EventCopy>, event_shards>;
+class EventCopyBuffer {
+public:
+    size_t size() const { return size_; }
+
+    void push_back(const EventCopy& copy) {
+        const size_t offset = size_ % block_size;
+        if (!offset) blocks_.push_back(std::make_unique_for_overwrite<EventCopy[]>(block_size));
+        blocks_.back()[offset] = copy;
+        ++size_;
+    }
+
+    template<class Function>
+    void visit(Function use) const {
+        for (size_t block = 0; block < blocks_.size(); ++block) {
+            const size_t count = std::min(block_size, size_ - block * block_size);
+            for (size_t offset = 0; offset < count; ++offset) use(blocks_[block][offset]);
+        }
+    }
+
+    void clear() {
+        blocks_.clear();
+        size_ = 0;
+    }
+
+private:
+    static constexpr size_t block_size = 1024;
+    std::vector<std::unique_ptr<EventCopy[]>> blocks_;
+    size_t size_ = 0;
+};
+
+using EventCopies = std::array<EventCopyBuffer, event_shards>;
 using Events = std::array<std::vector<Event>, person_shards>;
 using Clicks = std::array<std::vector<Click>, person_shards>;
 
@@ -269,7 +300,7 @@ void deduplicate(std::vector<EventCopies>& copies, size_t shard, Events& people)
     };
     std::vector<Slot> slots(capacity);
     for (const auto& worker : copies) {
-        for (const auto& row : worker[shard]) {
+        worker[shard].visit([&](const auto& row) {
             const size_t hash = hash_text(row.id);
             size_t at = (hash / event_shards) & mask;
             while (slots[at].copy && (slots[at].hash != hash || slots[at].copy->id != row.id)) {
@@ -278,7 +309,7 @@ void deduplicate(std::vector<EventCopies>& copies, size_t shard, Events& people)
             if (!slots[at].copy || row.ingest < slots[at].copy->ingest) {
                 slots[at] = {hash, &row};
             }
-        }
+        });
     }
     for (const auto& slot : slots) {
         if (slot.copy && !slot.copy->event.person.empty()) {
@@ -286,7 +317,7 @@ void deduplicate(std::vector<EventCopies>& copies, size_t shard, Events& people)
             people[hash_text(event.person) % person_shards].push_back(event);
         }
     }
-    for (auto& worker : copies) std::vector<EventCopy>().swap(worker[shard]);
+    for (auto& worker : copies) worker[shard].clear();
 }
 
 void parse_clicks(Text chunk, Clicks& shards, const Window& window,
@@ -335,11 +366,16 @@ void index_and_sort(size_t shard, std::vector<Events>& event_workers,
     partition.events.reserve(events);
     partition.clicks.reserve(clicks);
     TextIndex people(std::min<size_t>(events / 24, 1 << 18));
+    std::vector<size_t> counts;
     for (auto& worker : event_workers) {
         for (const auto& event : worker[shard]) {
             const uint32_t next = partition.names.size();
             const auto index = people.intern(event.person, next);
-            if (index == next) partition.names.push_back(event.person);
+            if (index == next) {
+                partition.names.push_back(event.person);
+                counts.push_back(0);
+            }
+            ++counts[index];
             partition.events.push_back({event.time, index, event.price, event.category});
         }
         std::vector<Event>().swap(worker[shard]);
@@ -353,10 +389,17 @@ void index_and_sort(size_t shard, std::vector<Events>& event_workers,
         }
         std::vector<Click>().swap(worker[shard]);
     }
-    std::sort(partition.events.begin(), partition.events.end(), [](const auto& a, const auto& b) {
-        if (a.person != b.person) return a.person < b.person;
-        return a.time < b.time;
-    });
+    // Group by compact person index with prefix sums, then sort timestamps within each person.
+    std::vector<size_t> offsets(counts.size() + 1);
+    std::partial_sum(counts.begin(), counts.end(), offsets.begin() + 1);
+    auto positions = offsets;
+    std::vector<IndexedEvent> grouped(events);
+    for (const auto& event : partition.events) grouped[positions[event.person]++] = event;
+    for (size_t person = 0; person < counts.size(); ++person) {
+        std::sort(grouped.begin() + offsets[person], grouped.begin() + offsets[person + 1],
+                  [](const auto& a, const auto& b) { return a.time < b.time; });
+    }
+    partition.events.swap(grouped);
     std::sort(partition.clicks.begin(), partition.clicks.end(), [](const auto& a, const auto& b) {
         if (a.person != b.person) return a.person < b.person;
         if (a.time != b.time) return a.time < b.time;

@@ -7,7 +7,7 @@ RUNNER ?= build/shopping-sessions
 PLATFORM := linux/amd64
 export IMAGE
 
-.PHONY: build docker official generator dev fixtures run-dev check-dev
+.PHONY: build docker official generator dev fixtures run-dev check-dev check-csv
 build:
 	scripts/build.sh
 
@@ -31,3 +31,8 @@ run-dev:
 
 check-dev:
 	python3 $(OFFICIAL)/scripts/compare.py $(OUT) official/dev-answer
+
+check-csv:
+	mkdir -p build
+	$(CXX) -O2 -std=c++20 -Wall -Wextra -Isrc tests/csv_parser.cpp -o build/check-csv
+	build/check-csv

@@ -17,6 +17,9 @@
 #include <unistd.h>
 #include <utility>
 #include <vector>
+#if defined(__x86_64__)
+#include <immintrin.h>
+#endif
 
 namespace fs = std::filesystem;
 using Text = std::string_view;
@@ -108,7 +111,7 @@ inline Text after_header(Text file) {
 }
 
 template<size_t Columns>
-bool split_csv(Text line, std::array<Text, Columns>& fields) {
+bool split_csv_scalar(Text line, std::array<Text, Columns>& fields) {
     const char* begin = line.data();
     const char* end = begin + line.size();
     for (size_t col = 0; col < Columns; ++col) {
@@ -129,6 +132,73 @@ bool split_csv(Text line, std::array<Text, Columns>& fields) {
         if (col + 1 != Columns) begin = comma + 1;
     }
     return true;
+}
+
+#if defined(__x86_64__)
+struct CsvMasks {
+    uint32_t commas;
+    uint32_t quotes;
+};
+
+__attribute__((target("avx2")))
+inline CsvMasks csv_masks(const char* start) {
+    const auto bytes = _mm256_loadu_si256(reinterpret_cast<const __m256i_u*>(start));
+    return {
+        static_cast<uint32_t>(_mm256_movemask_epi8(_mm256_cmpeq_epi8(bytes, _mm256_set1_epi8(',')))),
+        static_cast<uint32_t>(_mm256_movemask_epi8(_mm256_cmpeq_epi8(bytes, _mm256_set1_epi8('"'))))
+    };
+}
+
+template<size_t Columns>
+__attribute__((target("avx2,popcnt")))
+bool split_csv_vector(Text line, std::array<Text, Columns>& fields) {
+    std::array<unsigned, Columns> ends;
+    const char* data = line.data();
+    const unsigned size = line.size();
+    unsigned count = 0, quotes = 0, offset = 0;
+    const auto scan = [&](unsigned at, uint32_t keep) {
+        const auto masks = csv_masks(data + at);
+        uint32_t commas = masks.commas & keep;
+        quotes += __builtin_popcount(masks.quotes & keep);
+        while (commas) {
+            if (count == Columns - 1) return false;
+            ends[count++] = at + __builtin_ctz(commas);
+            commas &= commas - 1;
+        }
+        return true;
+    };
+    for (; offset + 32 <= size; offset += 32) {
+        if (!scan(offset, UINT32_MAX)) return false;
+    }
+    if (offset < size && !scan(size - 32, UINT32_MAX << (32 - (size - offset)))) return false;
+    if (count != Columns - 1) return false;
+    ends[Columns - 1] = size;
+
+    unsigned begin = 0, wrapper_quotes = 0;
+    for (size_t col = 0; col < Columns; ++col) {
+        const unsigned end = ends[col];
+        if (end - begin >= 2 && data[begin] == '"' && data[end - 1] == '"') {
+            fields[col] = Text(data + begin + 1, end - begin - 2);
+            wrapper_quotes += 2;
+        } else {
+            fields[col] = Text(data + begin, end - begin);
+        }
+        begin = end + 1;
+    }
+    // Valid wrappers account for every quote in the row, including empty quoted fields.
+    return quotes == wrapper_quotes;
+}
+#endif
+
+template<size_t Columns>
+bool split_csv(Text line, std::array<Text, Columns>& fields) {
+#if defined(__x86_64__)
+    if (line.size() >= 32 && line.size() <= 128 &&
+        __builtin_cpu_supports("avx2") && __builtin_cpu_supports("popcnt")) {
+        return split_csv_vector(line, fields);
+    }
+#endif
+    return split_csv_scalar(line, fields);
 }
 
 inline int digits2(const char* text) {
