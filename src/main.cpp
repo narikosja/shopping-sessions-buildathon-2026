@@ -1,0 +1,515 @@
+#include "input.hpp"
+#include "output.hpp"
+
+#include <algorithm>
+#include <atomic>
+#include <exception>
+#include <iostream>
+#include <mutex>
+#include <numeric>
+#include <thread>
+
+constexpr size_t event_shards = 256;
+constexpr size_t person_shards = 64;
+constexpr uint32_t no_index = std::numeric_limits<uint32_t>::max();
+
+size_t hash_text(Text value) {
+    return std::hash<Text>{}(value);
+}
+
+template<class Function>
+void parallel(size_t items, size_t workers, Function run) {
+    if (!items) return;
+    std::atomic<size_t> next{0};
+    std::exception_ptr failure;
+    std::mutex failure_lock;
+    auto work = [&](size_t worker) {
+        try {
+            for (size_t index; (index = next.fetch_add(1, std::memory_order_relaxed)) < items;) {
+                run(worker, index);
+            }
+        } catch (...) {
+            next.store(items, std::memory_order_relaxed);
+            const std::lock_guard lock(failure_lock);
+            if (!failure) failure = std::current_exception();
+        }
+    };
+    std::vector<std::jthread> threads;
+    for (size_t i = 1; i < std::min(workers, items); ++i) threads.emplace_back(work, i);
+    work(0);
+    threads.clear();
+    if (failure) std::rethrow_exception(failure);
+}
+
+class Timings {
+public:
+    Timings() : begin_(Clock::now()), last_(begin_) {}
+    void mark(const char* name) {
+        const auto now = Clock::now();
+        std::cerr << name << "_s=" << std::chrono::duration<double>(now - last_).count() << '\n';
+        last_ = now;
+    }
+    void total() const {
+        std::cerr << "total_s=" << std::chrono::duration<double>(Clock::now() - begin_).count() << '\n';
+    }
+private:
+    using Clock = std::chrono::steady_clock;
+    Clock::time_point begin_, last_;
+};
+
+using Index = std::unordered_map<Text, uint32_t>;
+
+class Identities {
+public:
+    explicit Identities(const InputParts& parts) {
+        for (Text chunk : parts.chunks) {
+            for_lines(chunk, [&](Text line) {
+                std::array<Text, 2> fields;
+                if (split_csv(line, fields) && !fields[0].empty() && !fields[1].empty()) {
+                    const auto a = intern(fields[0]);
+                    const auto b = intern(fields[1]);
+                    join(a, b);
+                }
+            });
+        }
+        names_.resize(parent_.size());
+        for (const auto& [name, index] : indexes_) {
+            const auto root = find(index);
+            if (names_[root].empty() || name < names_[root]) names_[root] = name;
+        }
+        for (size_t i = 0; i < parent_.size(); ++i) names_[i] = names_[find(i)];
+    }
+
+    Text person(Text id) const {
+        const auto found = indexes_.find(id);
+        return found == indexes_.end() ? id : names_[found->second];
+    }
+
+private:
+    uint32_t intern(Text id) {
+        const uint32_t next = parent_.size();
+        const auto [it, inserted] = indexes_.try_emplace(id, next);
+        if (inserted) {
+            parent_.push_back(next);
+            size_.push_back(1);
+        }
+        return it->second;
+    }
+
+    uint32_t find(uint32_t node) {
+        while (parent_[node] != node) {
+            parent_[node] = parent_[parent_[node]];
+            node = parent_[node];
+        }
+        return node;
+    }
+
+    void join(uint32_t a, uint32_t b) {
+        a = find(a);
+        b = find(b);
+        if (a == b) return;
+        if (size_[a] < size_[b]) std::swap(a, b);
+        parent_[b] = a;
+        size_[a] += size_[b];
+    }
+
+    Index indexes_;
+    std::vector<uint32_t> parent_, size_;
+    std::vector<Text> names_;
+};
+
+struct Lookups {
+    Mapping product_file, campaign_file;
+    Index products, campaign_index;
+    std::vector<Text> categories{"unknown"};
+    std::vector<Campaign> campaigns{{"organic", "organic"}};
+
+    explicit Lookups(const fs::path& data)
+        : product_file(data / "products.csv"), campaign_file(data / "campaigns.csv") {
+        Index category_index;
+        for_lines(after_header(product_file.data()), [&](Text line) {
+            std::array<Text, 2> fields;
+            if (!split_csv(line, fields)) throw std::runtime_error("Malformed product lookup");
+            const auto [category, inserted] = category_index.try_emplace(fields[1], categories.size());
+            if (inserted) categories.push_back(fields[1]);
+            products.emplace(fields[0], category->second);
+        });
+        for_lines(after_header(campaign_file.data()), [&](Text line) {
+            std::array<Text, 2> fields;
+            if (!split_csv(line, fields)) throw std::runtime_error("Malformed campaign lookup");
+            campaign_index.emplace(fields[0], campaigns.size());
+            campaigns.push_back({fields[0], fields[1]});
+        });
+    }
+};
+
+struct Event {
+    Text person;
+    Time time;
+    uint32_t price, category;
+};
+
+struct EventCopy {
+    Text id;
+    Time ingest;
+    Event event;
+};
+
+struct Click {
+    Text person, id;
+    Time time;
+    uint32_t campaign;
+};
+
+using EventCopies = std::array<std::vector<EventCopy>, event_shards>;
+using Events = std::array<std::vector<Event>, person_shards>;
+using Clicks = std::array<std::vector<Click>, person_shards>;
+
+Event validate_event(const std::array<Text, 7>& row, Time ingest, const Window& window,
+                     const Lookups& lookups, const Identities& identities) {
+    const auto type = row[4];
+    if (row[1].empty() || row[5].empty() || (type != "view" && type != "cart" && type != "purchase")) {
+        return {};
+    }
+    const Time time = timestamp(row[2]);
+    if (time == invalid_time || time < window.begin || time >= window.end || ingest - time > day_ms) {
+        return {};
+    }
+    uint32_t price = 0;
+    uint32_t category = 0;
+    if (type == "purchase") {
+        const Time parsed = unsigned_decimal(row[6], 10000000);
+        if (parsed <= 0) return {};
+        price = parsed;
+        const auto product = lookups.products.find(row[5]);
+        if (product != lookups.products.end()) category = product->second;
+    }
+    return {identities.person(row[1]), time, price, category};
+}
+
+void parse_events(Text chunk, EventCopies& shards, const Window& window,
+                  const Lookups& lookups, const Identities& identities) {
+    for_lines(chunk, [&](Text line) {
+        std::array<Text, 7> row;
+        if (!split_csv(line, row) || row[0].empty()) return;
+        const Time ingest = timestamp(row[3]);
+        if (ingest == invalid_time) throw std::runtime_error("Invalid ingest_ts");
+        const auto shard = hash_text(row[0]) % event_shards;
+        // A parseable but invalid copy must still be eligible to win deduplication.
+        shards[shard].push_back({row[0], ingest, validate_event(row, ingest, window, lookups, identities)});
+    });
+}
+
+void deduplicate(std::vector<EventCopies>& copies, size_t shard, Events& people) {
+    size_t size = 0;
+    for (const auto& worker : copies) size += worker[shard].size();
+    if (!size) return;
+
+    // Keep the map local to a shard. Hashes choose a slot, and full IDs establish equality.
+    size_t capacity = 1;
+    while (capacity < size + size / 2 + 1) capacity *= 2;
+    const size_t mask = capacity - 1;
+    struct Slot {
+        size_t hash = 0;
+        const EventCopy* copy = nullptr;
+    };
+    std::vector<Slot> slots(capacity);
+    for (const auto& worker : copies) {
+        for (const auto& row : worker[shard]) {
+            const size_t hash = hash_text(row.id);
+            size_t at = (hash / event_shards) & mask;
+            while (slots[at].copy && (slots[at].hash != hash || slots[at].copy->id != row.id)) {
+                at = (at + 1) & mask;
+            }
+            if (!slots[at].copy || row.ingest < slots[at].copy->ingest) {
+                slots[at] = {hash, &row};
+            }
+        }
+    }
+    for (const auto& slot : slots) {
+        if (slot.copy && !slot.copy->event.person.empty()) {
+            const auto& event = slot.copy->event;
+            people[hash_text(event.person) % person_shards].push_back(event);
+        }
+    }
+    for (auto& worker : copies) std::vector<EventCopy>().swap(worker[shard]);
+}
+
+void parse_clicks(Text chunk, Clicks& shards, const Window& window,
+                  const Lookups& lookups, const Identities& identities) {
+    for_lines(chunk, [&](Text line) {
+        std::array<Text, 4> row;
+        if (!split_csv(line, row) || row[0].empty() || row[1].empty()) return;
+        const Time time = timestamp(row[3]);
+        if (time == invalid_time || time < window.begin - week_ms || time >= window.end) return;
+        const auto campaign = lookups.campaign_index.find(row[2]);
+        if (campaign == lookups.campaign_index.end()) return;
+        const Text person = identities.person(row[1]);
+        shards[hash_text(person) % person_shards].push_back({person, row[0], time, campaign->second});
+    });
+}
+
+struct IndexedEvent {
+    Time time;
+    uint32_t person, price, category;
+};
+
+struct IndexedClick {
+    Time time;
+    uint32_t person, campaign;
+    Text id;
+};
+
+struct Session {
+    Time start;
+    int64_t revenue;
+    uint32_t person;
+};
+
+struct Partition {
+    std::vector<IndexedEvent> events;
+    std::vector<IndexedClick> clicks;
+    std::vector<Text> names;
+    std::vector<Session> sessions;
+};
+
+void index_and_sort(size_t shard, std::vector<Events>& event_workers,
+                    std::vector<Clicks>& click_workers, Partition& partition) {
+    size_t events = 0, clicks = 0;
+    for (const auto& worker : event_workers) events += worker[shard].size();
+    for (const auto& worker : click_workers) clicks += worker[shard].size();
+    partition.events.reserve(events);
+    partition.clicks.reserve(clicks);
+    Index people;
+    for (auto& worker : event_workers) {
+        for (const auto& event : worker[shard]) {
+            const auto [index, inserted] = people.try_emplace(event.person, partition.names.size());
+            if (inserted) partition.names.push_back(event.person);
+            partition.events.push_back({event.time, index->second, event.price, event.category});
+        }
+        std::vector<Event>().swap(worker[shard]);
+    }
+    for (auto& worker : click_workers) {
+        for (const auto& click : worker[shard]) {
+            const auto person = people.find(click.person);
+            if (person != people.end()) {
+                partition.clicks.push_back({click.time, person->second, click.campaign, click.id});
+            }
+        }
+        std::vector<Click>().swap(worker[shard]);
+    }
+    std::sort(partition.events.begin(), partition.events.end(), [](const auto& a, const auto& b) {
+        if (a.person != b.person) return a.person < b.person;
+        return a.time < b.time;
+    });
+    std::sort(partition.clicks.begin(), partition.clicks.end(), [](const auto& a, const auto& b) {
+        if (a.person != b.person) return a.person < b.person;
+        if (a.time != b.time) return a.time < b.time;
+        return a.id > b.id;
+    });
+    // Identical click copies have the same person and timestamp and are now adjacent.
+    const auto unique_end = std::unique(partition.clicks.begin(), partition.clicks.end(),
+        [](const auto& a, const auto& b) {
+            return a.time == b.time && a.person == b.person && a.id == b.id;
+        });
+    partition.clicks.erase(unique_end, partition.clicks.end());
+}
+
+void sessions_and_users(Partition& partition, std::vector<UserDay>& users,
+                        const std::vector<Text>& categories) {
+    std::vector<int64_t> category_revenue(categories.size());
+    std::vector<uint32_t> purchased;
+    uint32_t last_person = no_index;
+    Time previous = 0;
+    auto flush_category = [&] {
+        auto& row = users.back();
+        int64_t highest = 0;
+        for (uint32_t category : purchased) {
+            auto& total = category_revenue[category];
+            if (total > highest ||
+                (total == highest && categories[category] < categories[row.category])) {
+                row.category = category;
+                highest = total;
+            }
+            total = 0;
+        }
+        purchased.clear();
+    };
+
+    for (const auto& event : partition.events) {
+        if (event.person != last_person || event.time - previous > session_gap_ms) {
+            const int32_t day = utc_day(event.time);
+            if (event.person != last_person || day != users.back().day) {
+                if (!users.empty()) flush_category();
+                users.push_back({partition.names[event.person], day, no_category, 0, 0, 0});
+            }
+            partition.sessions.push_back({event.time, 0, event.person});
+            ++users.back().sessions;
+        }
+        previous = event.time;
+        last_person = event.person;
+        auto& row = users.back();
+        ++row.events;
+        if (event.price) {
+            row.revenue += event.price;
+            partition.sessions.back().revenue += event.price;
+            auto& total = category_revenue[event.category];
+            if (!total) purchased.push_back(event.category);
+            total += event.price;
+        }
+    }
+    if (!users.empty()) flush_category();
+    std::vector<IndexedEvent>().swap(partition.events);
+}
+
+class ActiveCampaigns {
+public:
+    explicit ActiveCampaigns(size_t count) : counts_(count), positions_(count) {}
+
+    void add(uint32_t campaign) {
+        if (counts_[campaign]++ == 0) {
+            positions_[campaign] = active.size();
+            active.push_back(campaign);
+        }
+    }
+
+    void remove(uint32_t campaign) {
+        if (--counts_[campaign] == 0) {
+            const auto tail = active.back();
+            const auto position = positions_[campaign];
+            active[position] = tail;
+            positions_[tail] = position;
+            active.pop_back();
+        }
+    }
+
+    void clear() {
+        for (auto campaign : active) counts_[campaign] = 0;
+        active.clear();
+    }
+
+    std::vector<uint32_t> active;
+private:
+    std::vector<size_t> counts_, positions_;
+};
+
+void attribute(Partition& partition, CampaignDays& totals, size_t campaigns) {
+    const auto& clicks = partition.clicks;
+    ActiveCampaigns active(campaigns);
+    uint32_t last_person = no_index;
+    size_t first = 0, next = 0;
+    for (const auto& session : partition.sessions) {
+        if (session.person != last_person) {
+            active.clear();
+            while (next < clicks.size() && clicks[next].person < session.person) ++next;
+            first = next;
+            last_person = session.person;
+        }
+        const Time cutoff = session.start - week_ms;
+        while (first < next && clicks[first].time < cutoff) {
+            active.remove(clicks[first++].campaign);
+        }
+        // On the first session or after a long gap, discard clicks that are already too old.
+        while (next < clicks.size() && clicks[next].person == session.person &&
+               clicks[next].time < cutoff) {
+            ++next;
+            ++first;
+        }
+        while (next < clicks.size() && clicks[next].person == session.person &&
+               clicks[next].time <= session.start) {
+            active.add(clicks[next++].campaign);
+        }
+        // Click IDs are descending within a timestamp, so the latest entry wins ties.
+        const uint32_t credited = first == next ? 0 : clicks[next - 1].campaign;
+        const int32_t day = utc_day(session.start);
+        auto& row = totals[campaign_day_key(credited, day)];
+        ++row.sessions;
+        row.purchasing_sessions += (session.revenue > 0);
+        row.revenue += session.revenue;
+        for (auto campaign : active.active) ++totals[campaign_day_key(campaign, day)].assisted_sessions;
+    }
+    std::vector<Session>().swap(partition.sessions);
+    std::vector<IndexedClick>().swap(partition.clicks);
+}
+
+const char* environment(const char* key, const char* fallback) {
+    const auto* value = std::getenv(key);
+    return value && *value ? value : fallback;
+}
+
+int main(int argc, char** argv) {
+    try {
+        if (argc != 1 && argc != 3) throw std::runtime_error("Usage: shopping-sessions [DATA_DIR OUTPUT_DIR]");
+        const fs::path data = argc == 3 ? argv[1] : environment("DATA_DIR", "/data");
+        const fs::path output = argc == 3 ? argv[2] : environment("OUTPUT_DIR", "/output");
+        const int workers = std::clamp(std::stoi(environment("NCPU", "8")), 1, 64);
+        Timings timings;
+        const Window window = window_from_manifest(data / "manifest.json");
+        const InputParts link_files(data / "links");
+        const Identities identities(link_files);
+        const Lookups lookups(data);
+        timings.mark("identity_and_lookups");
+
+        const InputParts event_files(data / "events"), click_files(data / "clicks");
+        std::vector<EventCopies> copies(workers);
+        std::vector<Clicks> clicks(workers);
+        const size_t event_chunks = event_files.chunks.size();
+        parallel(event_chunks + click_files.chunks.size(), workers, [&](size_t worker, size_t index) {
+            if (index < event_chunks) {
+                parse_events(event_files.chunks[index], copies[worker], window, lookups, identities);
+            } else {
+                parse_clicks(click_files.chunks[index - event_chunks], clicks[worker], window, lookups, identities);
+            }
+        });
+        timings.mark("input_parse");
+
+        std::vector<Events> events(workers);
+        parallel(event_shards, workers, [&](size_t worker, size_t shard) {
+            deduplicate(copies, shard, events[worker]);
+        });
+        timings.mark("event_dedup");
+
+        std::vector<Partition> partitions(person_shards);
+        parallel(person_shards, workers, [&](size_t, size_t shard) {
+            index_and_sort(shard, events, clicks, partitions[shard]);
+        });
+        timings.mark("person_index_and_sort");
+
+        std::vector<std::vector<UserDay>> user_rows(person_shards);
+        parallel(person_shards, workers, [&](size_t, size_t shard) {
+            sessions_and_users(partitions[shard], user_rows[shard], lookups.categories);
+        });
+        timings.mark("sessionize_and_user_aggregate");
+
+        std::vector<CampaignDays> campaign_rows(workers);
+        parallel(person_shards, workers, [&](size_t worker, size_t shard) {
+            attribute(partitions[shard], campaign_rows[worker], lookups.campaigns.size());
+        });
+        timings.mark("attribution_and_assists");
+
+        auto& totals = campaign_rows.front();
+        for (size_t i = 1; i < campaign_rows.size(); ++i) {
+            for (const auto& [key, value] : campaign_rows[i]) totals[key].add(value);
+        }
+        timings.mark("campaign_aggregate");
+
+        fs::create_directories(output / "user_daily");
+        fs::create_directories(output / "campaign_daily");
+        constexpr size_t output_parts = 8;
+        parallel(output_parts + 1, workers, [&](size_t, size_t part) {
+            if (part == output_parts) {
+                write_campaigns(output / "campaign_daily" / "part-0.parquet", totals, lookups.campaigns);
+                return;
+            }
+            const size_t start = part * person_shards / output_parts;
+            const size_t end = (part + 1) * person_shards / output_parts;
+            const auto filename = "part-" + std::to_string(part) + ".parquet";
+            write_users(output / "user_daily" / filename, user_rows, start, end, lookups.categories);
+        });
+        timings.mark("parquet_output");
+        timings.total();
+    } catch (const std::exception& error) {
+        std::cerr << "shopping-sessions: " << error.what() << '\n';
+        return 1;
+    }
+}

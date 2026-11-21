@@ -1,0 +1,7 @@
+**
+!Dockerfile
+!requirements.txt
+!src/
+!src/**
+!scripts/
+!scripts/build.sh
