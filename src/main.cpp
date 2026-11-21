@@ -59,9 +59,70 @@ private:
 
 using Index = std::unordered_map<Text, uint32_t>;
 
+class TextIndex {
+public:
+    explicit TextIndex(size_t expected = 0) {
+        size_t capacity = 16;
+        while (capacity - capacity / 4 < expected) capacity *= 2;
+        slots_.resize(capacity);
+    }
+
+    uint32_t lookup(Text key) const {
+        const size_t hash = hash_text(key);
+        return slots_[position(key, hash)].index;
+    }
+
+    uint32_t intern(Text key, uint32_t index) {
+        const size_t hash = hash_text(key);
+        size_t at = position(key, hash);
+        if (slots_[at].index != no_index) return slots_[at].index;
+        if (size_ == slots_.size() - slots_.size() / 4) {
+            auto old = std::exchange(slots_, {});
+            slots_.resize(old.size() * 2);
+            for (const auto& slot : old) {
+                if (slot.index != no_index) slots_[position(slot.key, slot.hash)] = slot;
+            }
+            at = position(key, hash);
+        }
+        slots_[at] = {key, static_cast<uint32_t>(hash), index};
+        ++size_;
+        return index;
+    }
+
+private:
+    struct Slot {
+        Text key;
+        uint32_t hash = 0, index = no_index;
+    };
+
+    size_t position(Text key, uint32_t hash) const {
+        const size_t mask = slots_.size() - 1;
+        size_t at = hash & mask;
+        while (slots_[at].index != no_index && (slots_[at].hash != hash || slots_[at].key != key)) {
+            at = (at + 1) & mask;
+        }
+        return at;
+    }
+
+    std::vector<Slot> slots_;
+    size_t size_ = 0;
+};
+
 class Identities {
 public:
-    explicit Identities(const InputParts& parts) {
+    explicit Identities(const InputParts& parts)
+        : indexes_(std::min<size_t>(parts.bytes / 16, 1 << 22)) {
+        std::vector<Text> ids;
+        const auto intern = [&](Text id) {
+            const uint32_t next = parent_.size();
+            const auto index = indexes_.intern(id, next);
+            if (index == next) {
+                parent_.push_back(next);
+                size_.push_back(1);
+                ids.push_back(id);
+            }
+            return index;
+        };
         for (Text chunk : parts.chunks) {
             for_lines(chunk, [&](Text line) {
                 std::array<Text, 2> fields;
@@ -73,29 +134,22 @@ public:
             });
         }
         names_.resize(parent_.size());
-        for (const auto& [name, index] : indexes_) {
+        for (size_t index = 0; index < ids.size(); ++index) {
+            const Text name = ids[index];
             const auto root = find(index);
             if (names_[root].empty() || name < names_[root]) names_[root] = name;
         }
         for (size_t i = 0; i < parent_.size(); ++i) names_[i] = names_[find(i)];
+        std::vector<uint32_t>().swap(parent_);
+        std::vector<uint32_t>().swap(size_);
     }
 
     Text person(Text id) const {
-        const auto found = indexes_.find(id);
-        return found == indexes_.end() ? id : names_[found->second];
+        const auto found = indexes_.lookup(id);
+        return found == no_index ? id : names_[found];
     }
 
 private:
-    uint32_t intern(Text id) {
-        const uint32_t next = parent_.size();
-        const auto [it, inserted] = indexes_.try_emplace(id, next);
-        if (inserted) {
-            parent_.push_back(next);
-            size_.push_back(1);
-        }
-        return it->second;
-    }
-
     uint32_t find(uint32_t node) {
         while (parent_[node] != node) {
             parent_[node] = parent_[parent_[node]];
@@ -113,7 +167,7 @@ private:
         size_[a] += size_[b];
     }
 
-    Index indexes_;
+    TextIndex indexes_;
     std::vector<uint32_t> parent_, size_;
     std::vector<Text> names_;
 };
@@ -280,20 +334,21 @@ void index_and_sort(size_t shard, std::vector<Events>& event_workers,
     for (const auto& worker : click_workers) clicks += worker[shard].size();
     partition.events.reserve(events);
     partition.clicks.reserve(clicks);
-    Index people;
+    TextIndex people(std::min<size_t>(events / 24, 1 << 18));
     for (auto& worker : event_workers) {
         for (const auto& event : worker[shard]) {
-            const auto [index, inserted] = people.try_emplace(event.person, partition.names.size());
-            if (inserted) partition.names.push_back(event.person);
-            partition.events.push_back({event.time, index->second, event.price, event.category});
+            const uint32_t next = partition.names.size();
+            const auto index = people.intern(event.person, next);
+            if (index == next) partition.names.push_back(event.person);
+            partition.events.push_back({event.time, index, event.price, event.category});
         }
         std::vector<Event>().swap(worker[shard]);
     }
     for (auto& worker : click_workers) {
         for (const auto& click : worker[shard]) {
-            const auto person = people.find(click.person);
-            if (person != people.end()) {
-                partition.clicks.push_back({click.time, person->second, click.campaign, click.id});
+            const auto person = people.lookup(click.person);
+            if (person != no_index) {
+                partition.clicks.push_back({click.time, person, click.campaign, click.id});
             }
         }
         std::vector<Click>().swap(worker[shard]);

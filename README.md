@@ -41,3 +41,36 @@ time scripts/run-container.sh bench/practice bench/out
 ```
 
 The generated practice input uses a public generator seed. It is suitable for local timing and regression checks.
+
+## Local verification results
+
+The image built from this Dockerfile passed all 36 official fixtures and matched all
+117,038 `user_daily` and 27,400 `campaign_daily` rows in the published dev answer.
+A one-worker native run produced the same logical rows as the eight-worker run.
+Two additional fixtures passed: empty input and a 2,000-link chain with a CSV
+line over 2 MiB and pre-epoch UTC dates.
+
+The Dockerfile was built with Kaniko. The resulting image filesystem and entrypoint
+were run in Linux namespaces with UID 1000, offline networking, a read-only root
+and input, and eight pinned logical CPUs. Wall time includes launching that
+sandbox. These are local measurements on an AMD EPYC 7763 host.
+
+| Generated events | Clicks | Wall time |
+| ---: | ---: | ---: |
+| 1,000,000 | 250,000 | 0.51 s |
+| 5,000,000 | 1,250,000 | 1.76 s |
+| 20,000,000 | 5,000,000 | 4.69 s median (4.08, 4.69, 6.70 s) |
+
+The 20M-event runs peaked at 4.11 GiB resident memory. Both output tables matched
+the verified baseline on that input. Median stage timings in seconds:
+
+| Stage | Seconds |
+| --- | ---: |
+| Identity resolution and lookups | 0.436 |
+| CSV parsing | 1.929 |
+| Event deduplication | 0.756 |
+| Person indexing and sorting | 0.937 |
+| Sessionization and user aggregation | 0.039 |
+| Attribution and assists | 0.106 |
+| Campaign aggregation | 0.009 |
+| Parquet output | 0.128 |
