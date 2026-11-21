@@ -26,10 +26,10 @@ Before the container checks, build the image with `make docker`. Fixtures and ex
 
 ## Algorithm
 
-- Memory-map the CSV parts, scan only LF-delimited lines, and validate quoting and column counts before deduplication.
-  Scan short rows with AVX2 when the CPU supports it and use the same scalar rules for other rows.
-- Use union-find with path compression and union by size. Keep each component's byte-wise smallest ID as its name.
-- Buffer event copies in fixed-size blocks and partition them by a hash of the exact event ID. Keep the minimum ingest timestamp even when the winning copy is invalid. Partition survivors and valid clicks by resolved person.
+- Memory-map the CSV parts and scan LF, commas, and quotes together with AVX2 when supported. A scalar parser handles other CPUs. Both validate quoting and column counts before deduplication.
+- Store short nonzero ASCII IDs as reversible 64-bit keys. Preserve other IDs by reference and compare them byte for byte.
+- Build the union-find identity graph concurrently with event parsing. Keep each component's byte-wise smallest ID as its name.
+- Buffer event copies in fixed-size blocks and partition them by a hash of the exact event ID. Keep the minimum ingest timestamp even when the winning copy is invalid. Resolve the identities of surviving events and valid clicks before partitioning by person.
 - Group each partition by compact person index and sort timestamps within each person, then collect sessions and user-day rows in one pass. Use a rolling click window with per-campaign counts to assign credit and unique assists.
 - Write standard Parquet date, integer, and UTF-8 columns directly with Arrow's C++ Parquet writer.
 
@@ -49,8 +49,8 @@ The image built from this Dockerfile passed all 36 official fixtures and matched
 117,038 `user_daily` and 27,400 `campaign_daily` rows in the published dev answer.
 A one-worker native run produced the same logical rows as the eight-worker run.
 Two additional fixtures passed: empty input and a 2,000-link chain with a CSV
-line over 2 MiB and pre-epoch UTC dates. The AVX2 parser agreed with the scalar
-parser on 1,000,000 randomly generated lines, including malformed rows.
+line over 2 MiB and pre-epoch UTC dates. The streaming CSV parser, ID encoding, and timestamp fast path passed a randomized differential test
+with 1,000,000 generated cases each.
 
 The Dockerfile was built with Kaniko. The resulting image filesystem and entrypoint
 were run in Linux namespaces with UID 1000, offline networking, a read-only root
@@ -59,20 +59,20 @@ sandbox. These are local measurements on an AMD EPYC 7763 host.
 
 | Generated events | Clicks | Wall time |
 | ---: | ---: | ---: |
-| 1,000,000 | 250,000 | 0.30 s |
-| 5,000,000 | 1,250,000 | 1.51 s |
-| 20,000,000 | 5,000,000 | 4.39 s median (4.38, 4.39, 4.52 s) |
+| 1,000,000 | 250,000 | 0.33 s |
+| 5,000,000 | 1,250,000 | 0.80 s |
+| 20,000,000 | 5,000,000 | 1.90 s median (1.86, 1.90, 2.58 s) |
 
-The 20M-event runs peaked at 4.14 GiB resident memory. Both output tables matched
-the verified baseline on that input. Median stage timings in seconds:
+The 20M-event runs peaked at 3.54 GiB resident memory. Both output tables matched
+the previous scored implementation on the 5M and 20M inputs. Median stage timings in seconds:
 
 | Stage | Seconds |
 | --- | ---: |
-| Identity resolution and lookups | 0.422 |
-| CSV parsing | 1.855 |
-| Event deduplication | 0.817 |
-| Person indexing and sorting | 0.831 |
+| Setup | 0.010 |
+| CSV parsing and concurrent identity resolution | 0.693 |
+| Event deduplication and person partitioning | 0.484 |
+| Person indexing and sorting | 0.238 |
 | Sessionization and user aggregation | 0.040 |
 | Attribution and assists | 0.110 |
 | Campaign aggregation | 0.009 |
-| Parquet output | 0.121 |
+| Parquet output | 0.116 |

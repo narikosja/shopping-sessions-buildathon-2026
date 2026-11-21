@@ -1,10 +1,13 @@
 #include "input.hpp"
 #include "output.hpp"
+#include "key.hpp"
 
 #include <algorithm>
 #include <atomic>
 #include <exception>
 #include <iostream>
+#include <future>
+#include <optional>
 #include <memory>
 #include <mutex>
 #include <numeric>
@@ -13,10 +16,6 @@
 constexpr size_t event_shards = 256;
 constexpr size_t person_shards = 64;
 constexpr uint32_t no_index = std::numeric_limits<uint32_t>::max();
-
-size_t hash_text(Text value) {
-    return std::hash<Text>{}(value);
-}
 
 template<class Function>
 void parallel(size_t items, size_t workers, Function run) {
@@ -68,13 +67,13 @@ public:
         slots_.resize(capacity);
     }
 
-    uint32_t lookup(Text key) const {
-        const size_t hash = hash_text(key);
+    uint32_t lookup(Key key) const {
+        const size_t hash = key.hash();
         return slots_[position(key, hash)].index;
     }
 
-    uint32_t intern(Text key, uint32_t index) {
-        const size_t hash = hash_text(key);
+    uint32_t intern(Key key, uint32_t index) {
+        const size_t hash = key.hash();
         size_t at = position(key, hash);
         if (slots_[at].index != no_index) return slots_[at].index;
         if (size_ == slots_.size() - slots_.size() / 4) {
@@ -92,13 +91,13 @@ public:
 
 private:
     struct Slot {
-        Text key;
+        Key key;
         uint32_t hash = 0, index = no_index;
     };
 
-    size_t position(Text key, uint32_t hash) const {
+    size_t position(Key key, uint32_t hash) const {
         const size_t mask = slots_.size() - 1;
-        size_t at = hash & mask;
+        size_t at = std::rotr(hash, 6) & mask;
         while (slots_[at].index != no_index && (slots_[at].hash != hash || slots_[at].key != key)) {
             at = (at + 1) & mask;
         }
@@ -113,8 +112,8 @@ class Identities {
 public:
     explicit Identities(const InputParts& parts)
         : indexes_(std::min<size_t>(parts.bytes / 16, 1 << 22)) {
-        std::vector<Text> ids;
-        const auto intern = [&](Text id) {
+        std::vector<Key> ids;
+        const auto intern = [&](Key id) {
             const uint32_t next = parent_.size();
             const auto index = indexes_.intern(id, next);
             if (index == next) {
@@ -128,15 +127,15 @@ public:
             for_lines(chunk, [&](Text line) {
                 std::array<Text, 2> fields;
                 if (split_csv(line, fields) && !fields[0].empty() && !fields[1].empty()) {
-                    const auto a = intern(fields[0]);
-                    const auto b = intern(fields[1]);
+                    const auto a = intern(keys_.make(fields[0]));
+                    const auto b = intern(keys_.make(fields[1]));
                     join(a, b);
                 }
             });
         }
         names_.resize(parent_.size());
         for (size_t index = 0; index < ids.size(); ++index) {
-            const Text name = ids[index];
+            const Key name = ids[index];
             const auto root = find(index);
             if (names_[root].empty() || name < names_[root]) names_[root] = name;
         }
@@ -145,7 +144,7 @@ public:
         std::vector<uint32_t>().swap(size_);
     }
 
-    Text person(Text id) const {
+    Key person(Key id) const {
         const auto found = indexes_.lookup(id);
         return found == no_index ? id : names_[found];
     }
@@ -168,9 +167,10 @@ private:
         size_[a] += size_[b];
     }
 
+    KeyArena keys_;
     TextIndex indexes_;
     std::vector<uint32_t> parent_, size_;
-    std::vector<Text> names_;
+    std::vector<Key> names_;
 };
 
 struct Lookups {
@@ -199,19 +199,19 @@ struct Lookups {
 };
 
 struct Event {
-    Text person;
+    Key person;
     Time time;
     uint32_t price, category;
 };
 
 struct EventCopy {
-    Text id;
+    Key id;
     Time ingest;
     Event event;
 };
 
 struct Click {
-    Text person, id;
+    Key person, id;
     Time time;
     uint32_t campaign;
 };
@@ -228,7 +228,7 @@ public:
     }
 
     template<class Function>
-    void visit(Function use) const {
+    void visit(Function use) {
         for (size_t block = 0; block < blocks_.size(); ++block) {
             const size_t count = std::min(block_size, size_ - block * block_size);
             for (size_t offset = 0; offset < count; ++offset) use(blocks_[block][offset]);
@@ -251,12 +251,12 @@ using Events = std::array<std::vector<Event>, person_shards>;
 using Clicks = std::array<std::vector<Click>, person_shards>;
 
 Event validate_event(const std::array<Text, 7>& row, Time ingest, const Window& window,
-                     const Lookups& lookups, const Identities& identities) {
+                     const Lookups& lookups, KeyArena& keys, TimestampParser& times) {
     const auto type = row[4];
     if (row[1].empty() || row[5].empty() || (type != "view" && type != "cart" && type != "purchase")) {
         return {};
     }
-    const Time time = timestamp(row[2]);
+    const Time time = times.parse(row[2]);
     if (time == invalid_time || time < window.begin || time >= window.end || ingest - time > day_ms) {
         return {};
     }
@@ -269,23 +269,25 @@ Event validate_event(const std::array<Text, 7>& row, Time ingest, const Window& 
         const auto product = lookups.products.find(row[5]);
         if (product != lookups.products.end()) category = product->second;
     }
-    return {identities.person(row[1]), time, price, category};
+    return {keys.make(row[1]), time, price, category};
 }
 
 void parse_events(Text chunk, EventCopies& shards, const Window& window,
-                  const Lookups& lookups, const Identities& identities) {
-    for_lines(chunk, [&](Text line) {
-        std::array<Text, 7> row;
-        if (!split_csv(line, row) || row[0].empty()) return;
-        const Time ingest = timestamp(row[3]);
+                  const Lookups& lookups, KeyArena& keys) {
+    TimestampParser times;
+    for_csv<7>(chunk, [&](const auto& row) {
+        if (row[0].empty()) return;
+        const Time ingest = times.ingest(row[3]);
         if (ingest == invalid_time) throw std::runtime_error("Invalid ingest_ts");
-        const auto shard = hash_text(row[0]) % event_shards;
+        const Key id = keys.make(row[0]);
+        const auto shard = id.hash() % event_shards;
         // A parseable but invalid copy must still be eligible to win deduplication.
-        shards[shard].push_back({row[0], ingest, validate_event(row, ingest, window, lookups, identities)});
+        shards[shard].push_back({id, ingest, validate_event(row, ingest, window, lookups, keys, times)});
     });
 }
 
-void deduplicate(std::vector<EventCopies>& copies, size_t shard, Events& people) {
+void deduplicate(std::vector<EventCopies>& copies, size_t shard, Events& people,
+                 const Identities& identities) {
     size_t size = 0;
     for (const auto& worker : copies) size += worker[shard].size();
     if (!size) return;
@@ -294,43 +296,45 @@ void deduplicate(std::vector<EventCopies>& copies, size_t shard, Events& people)
     size_t capacity = 1;
     while (capacity < size + size / 2 + 1) capacity *= 2;
     const size_t mask = capacity - 1;
-    struct Slot {
-        size_t hash = 0;
-        const EventCopy* copy = nullptr;
-    };
-    std::vector<Slot> slots(capacity);
-    for (const auto& worker : copies) {
-        worker[shard].visit([&](const auto& row) {
-            const size_t hash = hash_text(row.id);
-            size_t at = (hash / event_shards) & mask;
-            while (slots[at].copy && (slots[at].hash != hash || slots[at].copy->id != row.id)) {
+    std::vector<EventCopy*> slots(capacity);
+    for (auto& worker : copies) {
+        worker[shard].visit([&](auto& row) {
+            size_t at = (row.id.hash() / event_shards) & mask;
+            while (slots[at] && slots[at]->id != row.id) {
                 at = (at + 1) & mask;
             }
-            if (!slots[at].copy || row.ingest < slots[at].copy->ingest) {
-                slots[at] = {hash, &row};
+            auto*& kept = slots[at];
+            if (!kept || row.ingest < kept->ingest) {
+                if (kept) kept->event.person = Key{};
+                kept = &row;
+            } else {
+                row.event.person = Key{};
             }
         });
     }
-    for (const auto& slot : slots) {
-        if (slot.copy && !slot.copy->event.person.empty()) {
-            const auto& event = slot.copy->event;
-            people[hash_text(event.person) % person_shards].push_back(event);
-        }
+    for (auto& worker : copies) {
+        worker[shard].visit([&](const auto& row) {
+            if (!row.event.person.empty()) {
+                Event event = row.event;
+                event.person = identities.person(event.person);
+                people[event.person.hash() % person_shards].push_back(event);
+            }
+        });
+        worker[shard].clear();
     }
-    for (auto& worker : copies) worker[shard].clear();
 }
 
 void parse_clicks(Text chunk, Clicks& shards, const Window& window,
-                  const Lookups& lookups, const Identities& identities) {
-    for_lines(chunk, [&](Text line) {
-        std::array<Text, 4> row;
-        if (!split_csv(line, row) || row[0].empty() || row[1].empty()) return;
-        const Time time = timestamp(row[3]);
+                  const Lookups& lookups, const Identities& identities, KeyArena& keys) {
+    TimestampParser times;
+    for_csv<4>(chunk, [&](const auto& row) {
+        if (row[0].empty() || row[1].empty()) return;
+        const Time time = times.parse(row[3]);
         if (time == invalid_time || time < window.begin - week_ms || time >= window.end) return;
         const auto campaign = lookups.campaign_index.find(row[2]);
         if (campaign == lookups.campaign_index.end()) return;
-        const Text person = identities.person(row[1]);
-        shards[hash_text(person) % person_shards].push_back({person, row[0], time, campaign->second});
+        const Key person = identities.person(keys.make(row[1]));
+        shards[person.hash() % person_shards].push_back({person, keys.make(row[0]), time, campaign->second});
     });
 }
 
@@ -342,7 +346,7 @@ struct IndexedEvent {
 struct IndexedClick {
     Time time;
     uint32_t person, campaign;
-    Text id;
+    Key id;
 };
 
 struct Session {
@@ -354,7 +358,7 @@ struct Session {
 struct Partition {
     std::vector<IndexedEvent> events;
     std::vector<IndexedClick> clicks;
-    std::vector<Text> names;
+    std::vector<Key> names;
     std::vector<Session> sessions;
 };
 
@@ -403,7 +407,7 @@ void index_and_sort(size_t shard, std::vector<Events>& event_workers,
     std::sort(partition.clicks.begin(), partition.clicks.end(), [](const auto& a, const auto& b) {
         if (a.person != b.person) return a.person < b.person;
         if (a.time != b.time) return a.time < b.time;
-        return a.id > b.id;
+        return b.id < a.id;
     });
     // Identical click copies have the same person and timestamp and are now adjacent.
     const auto unique_end = std::unique(partition.clicks.begin(), partition.clicks.end(),
@@ -544,26 +548,37 @@ int main(int argc, char** argv) {
         Timings timings;
         const Window window = window_from_manifest(data / "manifest.json");
         const InputParts link_files(data / "links");
-        const Identities identities(link_files);
+        std::optional<Identities> identities;
+        std::promise<const Identities*> graph;
+        const auto graph_ready = graph.get_future().share();
         const Lookups lookups(data);
-        timings.mark("identity_and_lookups");
+        timings.mark("setup");
 
         const InputParts event_files(data / "events"), click_files(data / "clicks");
         std::vector<EventCopies> copies(workers);
         std::vector<Clicks> clicks(workers);
+        std::vector<KeyArena> keys(workers);
         const size_t event_chunks = event_files.chunks.size();
-        parallel(event_chunks + click_files.chunks.size(), workers, [&](size_t worker, size_t index) {
-            if (index < event_chunks) {
-                parse_events(event_files.chunks[index], copies[worker], window, lookups, identities);
+        parallel(1 + event_chunks + click_files.chunks.size(), workers, [&](size_t worker, size_t index) {
+            if (index == 0) {
+                try {
+                    graph.set_value(&identities.emplace(link_files));
+                } catch (...) {
+                    graph.set_exception(std::current_exception());
+                    throw;
+                }
+            } else if (index <= event_chunks) {
+                parse_events(event_files.chunks[index - 1], copies[worker], window, lookups, keys[worker]);
             } else {
-                parse_clicks(click_files.chunks[index - event_chunks], clicks[worker], window, lookups, identities);
+                parse_clicks(click_files.chunks[index - event_chunks - 1], clicks[worker],
+                             window, lookups, *graph_ready.get(), keys[worker]);
             }
         });
-        timings.mark("input_parse");
+        timings.mark("input_parse_and_identity");
 
         std::vector<Events> events(workers);
         parallel(event_shards, workers, [&](size_t worker, size_t shard) {
-            deduplicate(copies, shard, events[worker]);
+            deduplicate(copies, shard, events[worker], *identities);
         });
         timings.mark("event_dedup");
 

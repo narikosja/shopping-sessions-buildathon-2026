@@ -45,7 +45,8 @@ void write_users(const fs::path& path, const std::vector<std::vector<UserDay>>& 
     reserve(rows, person, top, day, sessions, events, revenue);
     for (size_t i = start; i < end; ++i) {
         for (const auto& row : partitions[i]) {
-            require(person.Append(row.person));
+            std::array<char, 9> name;
+            require(person.Append(row.person.text(name)));
             if (row.category == no_category) require(top.AppendNull());
             else require(top.Append(categories[row.category]));
             day.UnsafeAppend(row.day);

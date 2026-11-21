@@ -1,10 +1,10 @@
 #pragma once
 
-#include "input.hpp"
+#include "key.hpp"
 #include <unordered_map>
 
 struct UserDay {
-    Text person;
+    Key person;
     int32_t day;
     uint32_t category;
     int64_t sessions;
